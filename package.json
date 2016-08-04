@@ -1,0 +1,20 @@
+{
+  "name": "react-store",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "immutable": "^3.8.1"
+  },
+  "devDependencies": {
+    "babel-cli": "^6.11.4",
+    "babel-plugin-transform-object-rest-spread": "^6.8.0",
+    "babel-preset-es2015": "^6.9.0",
+    "babel-preset-react": "^6.11.1"
+  }
+}
