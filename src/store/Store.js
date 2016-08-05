@@ -9,10 +9,10 @@ class Store {
   constructor(schema) {
     this.subscribers = new Set()
     this.schema = schema
-    this.pendingMutations = new Set()
-    this.updates = []
+    this.activeMutations = new Set()
+    this.actionStack = []
+    this.lastStableState = null
     this.initiateState()
-    this.addUpdate = this.addUpdate.bind(this)
   }
   initiateState() {
     const State = Record(
@@ -25,8 +25,17 @@ class Store {
     this.subscribers.add(func)
     return () => this.subscribers.delete(func)
   }
-  update(func) {
-    const nextState = func(this.state)
+  enqueueUpdates(updates) {
+    if(this.activeMutations.size > 0) {
+      if(this.actionStack.length === 0) {
+        this.lastStableState = this.state
+      }
+      this.actionStack.push(...updates)
+    } else {
+      this.lastStableState = null
+      this.actionStack.length = 0
+    }
+    const nextState = updates.reduce(reconcile, this.state)
     if(this.state !== nextState) {
       this.state = nextState
       this.subscribers.forEach((subscriber) => subscriber())
@@ -42,50 +51,44 @@ class Store {
     const networkRequest = this.network.send(query.getQuery())
     return networkRequest
       .then((response) => {
-        this.update((state) => {
-          return query.__getConfigs(response).map(this.addUpdate).reduce(applyUpdate, state)
-        })
+        this.enqueueUpdates(query.__getConfigs(response))
       })
       .catch((error) => {
-        this.update((state) => {
-          const mainConfig = this.addUpdate(query.__getConfigs(error)[0])
-          if(mainConfig) {
-            this.update((state) => {
-              return applyUpdate(state, { ...mainConfig, type: "ERROR", originalType: mainConfig.type })
-            })
-          }
-        })
+        const mainConfig = query.__getConfigs(error)[0]
+        if(mainConfig) {
+          this.enqueueUpdates([
+            { ...mainConfig, type: "ERROR", originalType: mainConfig.type }
+          ])
+          return Promise.reject()
+        }
         return Promise.reject()
       })
   }
-  fork(id) {
-    if(this.pendingMutations.size === 0) {
-      this.forkState = this.state
-    }
-    this.pendingMutations.add(id)
-  }
-  commit(id) {
-    this.pendingMutations.delete(id)
-    this.update((state) => {
-      console.log(this.updates.reduce(applyUpdate, this.forkState))
-      return this.updates.reduce(applyUpdate, this.forkState)
-    })
-    this.updates = []
-    this.forkState = null
-  }
-  rollback(id) {
-    this.pendingMutations.delete(id)
-    this.update((state) => {
-      return this.updates.filter((item) => item.mutationID !== id).reduce(applyUpdate, this.forkState)
-    })
-    this.updates = []
-    this.forkState = null
-  }
   commitUpdate(mutation) {
-    this.fork(mutation.id)
+    this.activeMutations.add(mutation.id)
+    this.enqueueUpdates(
+      mutation.__getOptimisticConfig()
+        .concat(
+          mutation.__getConfigs()
+            .filter((item) => item.type === "CHANGE" || item.type === "CHANGE_NODE" || item.type === "RANGE_ADD")
+            .map((item) => Object.assign({}, item, { type: getLoadTypeFromUpdateType(item.type) }))
+        )
+    )
     this.query(mutation)
-      .catch(() => this.rollback(mutation.id))
-      .then(() => this.commit(mutation.id))
+      .then(() => this.activeMutations.delete(mutation.id))
+      .catch(() => {
+        this.activeMutations.delete(mutation.id)
+        this.revertOptimisticUpdate(mutation.id)
+      })
+  }
+  revertOptimisticUpdate(mutationID) {
+    const updates = this.actionStack.filter((item) => !(item.mutationID === mutationID && item.isOptimistic))
+    console.log(this.actionStack, updates)
+    const nextState = updates.reduce(reconcile, this.lastStableState)
+    if(this.state !== nextState) {
+      this.state = nextState
+      this.subscribers.forEach((subscriber) => subscriber())
+    }
   }
   getData(component, props = {}) {
     const queryObject = component.getQueries(props)
@@ -94,11 +97,16 @@ class Store {
       .filter((query) => query.shouldQuery(this.state))
     return Promise.all(queries.map((query) => this.query(query)))
   }
-  addUpdate(update) {
-    if(this.pendingMutations.size > 0) {
-      this.updates.push(update)
-    }
-    return update
+}
+
+const getLoadTypeFromUpdateType = (type) => {
+  switch(type) {
+    case "CHANGE":
+      return "LOAD"
+    case "CHANGE_NODE":
+      return "LOAD_NODE"
+    case "RANGE_ADD":
+      return "LOAD_RANGE"
   }
 }
 
@@ -106,9 +114,13 @@ const getPathFromUpdateType = (type, id) => {
   switch(type) {
     case "CHANGE":
       return []
+    case "LOAD":
+      return []
     case "DELETE":
       return []
     case "CHANGE_NODE":
+      return ["nodes", id]
+    case "LOAD_NODE":
       return ["nodes", id]
     case "DELETE_NODE":
       return ["nodes", id]
@@ -116,18 +128,24 @@ const getPathFromUpdateType = (type, id) => {
       return ["lists", id]
     case "RANGE_DELETE":
       return ["lists", id]
+    case "LOAD_RANGE":
+      return ["lists", id]
     default:
       return []
   }
 }
 
-const applyUpdate = (state, update) => {
+const reconcile = (state, update) => {
   const path = [ update.field, ...getPathFromUpdateType(update.type, update.id) ]
   switch(update.type) {
     case "ERROR":
       return state.updateIn(path, (object) => object.setStatusAsErrored(update.error))
+    case "LOAD":
+      return state.updateIn(path, (edge) => edge.setStatusAsLoading())
     case "CHANGE_NODE":
       return state.updateIn(path, (edge) => edge.setNodeValue(update.value))
+    case "LOAD_NODE":
+      return state.updateIn(path, (edge) => edge.setStatusAsLoading())
     case "DELETE_NODE":
       return state.deleteIn(path, update.id)
     case "CHANGE":
@@ -136,6 +154,8 @@ const applyUpdate = (state, update) => {
       return state.deleteIn(path, update.id)
     case "RANGE_ADD":
       return state.updateIn(path, (list) => list.pushEdges(...update.value))
+    case "LOAD_RANGE":
+      return state.updateIn(path, (list) => list.setStatusAsLoading())
     case "RANGE_DELETE":
       return state.updateIn(path, (list) => list.update("edges", (edges) => edges.filter((item) => !(item in update.deleteIDs))))
     case "UPDATE":
