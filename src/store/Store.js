@@ -9,7 +9,10 @@ class Store {
   constructor(schema) {
     this.subscribers = new Set()
     this.schema = schema
+    this.pendingMutations = new Set()
+    this.updates = []
     this.initiateState()
+    this.addUpdate = this.addUpdate.bind(this)
   }
   initiateState() {
     const State = Record(
@@ -24,8 +27,8 @@ class Store {
   }
   update(func) {
     const nextState = func(this.state)
-    this.state = nextState
     if(this.state !== nextState) {
+      this.state = nextState
       this.subscribers.forEach((subscriber) => subscriber())
     }
   }
@@ -40,19 +43,62 @@ class Store {
     return networkRequest
       .then((response) => {
         this.update((state) => {
-          return query.getConfigs(response).reduce(applyUpdate, state)
+          return query.__getConfigs(response).map(this.addUpdate).reduce(applyUpdate, state)
         })
       })
       .catch((error) => {
         this.update((state) => {
-          const mainConfig = query.getConfigs(response)[0]
+          const mainConfig = this.addUpdate(query.__getConfigs(error)[0])
           if(mainConfig) {
             this.update((state) => {
               return applyUpdate(state, { ...mainConfig, type: "ERROR", originalType: mainConfig.type })
             })
           }
         })
+        return Promise.reject()
       })
+  }
+  fork(id) {
+    if(this.pendingMutations.size === 0) {
+      this.forkState = this.state
+    }
+    this.pendingMutations.add(id)
+  }
+  commit(id) {
+    this.pendingMutations.delete(id)
+    this.update((state) => {
+      console.log(this.updates.reduce(applyUpdate, this.forkState))
+      return this.updates.reduce(applyUpdate, this.forkState)
+    })
+    this.updates = []
+    this.forkState = null
+  }
+  rollback(id) {
+    this.pendingMutations.delete(id)
+    this.update((state) => {
+      return this.updates.filter((item) => item.mutationID !== id).reduce(applyUpdate, this.forkState)
+    })
+    this.updates = []
+    this.forkState = null
+  }
+  commitUpdate(mutation) {
+    this.fork(mutation.id)
+    this.query(mutation)
+      .catch(() => this.rollback(mutation.id))
+      .then(() => this.commit(mutation.id))
+  }
+  getData(component, props = {}) {
+    const queryObject = component.getQueries(props)
+    const queries = Object.keys(queryObject)
+      .map((key) => queryObject[key])
+      .filter((query) => query.shouldQuery(this.state))
+    return Promise.all(queries.map((query) => this.query(query)))
+  }
+  addUpdate(update) {
+    if(this.pendingMutations.size > 0) {
+      this.updates.push(update)
+    }
+    return update
   }
 }
 
