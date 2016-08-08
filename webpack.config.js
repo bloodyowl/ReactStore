@@ -1,6 +1,7 @@
 module.exports = {
   entry: {
     "mutation": "./examples/mutation",
+    "lists": "./examples/lists",
   },
   output: {
     path: "./dist",

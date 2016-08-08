@@ -2,6 +2,7 @@ import { Record } from "immutable"
 
 import ResourceStoreRecord from "../records/ResourceStoreRecord"
 import EdgeRecord from "../records/EdgeRecord"
+import ListRecord from "../records/ListRecord"
 
 // TODO: handle mutations
 // TODO: handle optimistic updates for mutations
@@ -48,7 +49,12 @@ class Store {
     this.network = network
   }
   query(query) {
-    const networkRequest = this.network.send(query.getQuery())
+    const networkRequest = this.network.send(query.getQuery(this.state))
+    this.enqueueUpdates(
+      query.__getConfigs()
+        .filter((item) => item.type === "CHANGE" || item.type === "CHANGE_NODE" || item.type === "RANGE_ADD")
+        .map((item) => Object.assign({}, item, { type: getLoadTypeFromUpdateType(item.type) }))
+    )
     return networkRequest
       .then((response) => {
         this.enqueueUpdates(query.__getConfigs(response))
@@ -83,83 +89,59 @@ class Store {
   }
   revertOptimisticUpdate(mutationID) {
     const updates = this.actionStack.filter((item) => !(item.mutationID === mutationID && item.isOptimistic))
-    console.log(this.actionStack, updates)
     const nextState = updates.reduce(reconcile, this.lastStableState)
     if(this.state !== nextState) {
       this.state = nextState
       this.subscribers.forEach((subscriber) => subscriber())
     }
   }
-  getData(component, props = {}) {
-    const queryObject = component.getQueries(props)
+  getData(component, props = {}, variables = component.getInitialVariables()) {
+    const queryObject = component.getQueries(props, variables)
     const queries = Object.keys(queryObject)
       .map((key) => queryObject[key])
-      .filter((query) => query.shouldQuery(this.state))
+      .filter((query) => query.shouldQuery(this.state, variables))
     return Promise.all(queries.map((query) => this.query(query)))
   }
 }
 
 const getLoadTypeFromUpdateType = (type) => {
   switch(type) {
+    case "RANGE_ADD":
+      return "LOAD_RANGE"
     case "CHANGE":
       return "LOAD"
     case "CHANGE_NODE":
       return "LOAD_NODE"
-    case "RANGE_ADD":
-      return "LOAD_RANGE"
-  }
-}
-
-const getPathFromUpdateType = (type, id) => {
-  switch(type) {
-    case "CHANGE":
-      return []
-    case "LOAD":
-      return []
-    case "DELETE":
-      return []
-    case "CHANGE_NODE":
-      return ["nodes", id]
-    case "LOAD_NODE":
-      return ["nodes", id]
-    case "DELETE_NODE":
-      return ["nodes", id]
-    case "RANGE_ADD":
-      return ["lists", id]
-    case "RANGE_DELETE":
-      return ["lists", id]
-    case "LOAD_RANGE":
-      return ["lists", id]
-    default:
-      return []
   }
 }
 
 const reconcile = (state, update) => {
-  const path = [ update.field, ...getPathFromUpdateType(update.type, update.id) ]
   switch(update.type) {
+
     case "ERROR":
-      return state.updateIn(path, (object) => object.setStatusAsErrored(update.error))
-    case "LOAD":
-      return state.updateIn(path, (edge) => edge.setStatusAsLoading())
+      return state.update(update.field, (edge) => edge.setStatusAsErrored(update.error))
+
     case "CHANGE_NODE":
-      return state.updateIn(path, (edge) => edge.setNodeValue(update.value))
+      return state.update(update.field, (resource) => resource.node(update.id, (edge) => edge.setNodeValue(update.value)))
     case "LOAD_NODE":
-      return state.updateIn(path, (edge) => edge.setStatusAsLoading())
+      return state.update(update.field, (resource) => ressource.node(update.id, (edge) => edge.setStatusAsLoading()))
     case "DELETE_NODE":
-      return state.deleteIn(path, update.id)
+      return state.update(update.field, (resource) => resource.deleteNode(update.id))
+
+    case "LOAD":
+      return state.update(update.field, (edge) => edge.setStatusAsLoading())
     case "CHANGE":
-      return state.updateIn(path, (edge) => edge.setNodeValue(update.value))
+      return state.update(update.field, (edge) => edge.setNodeValue(update.value))
     case "DELETE":
-      return state.deleteIn(path, update.id)
+      return state.deleteIn([update.field, update.value])
+
     case "RANGE_ADD":
-      return state.updateIn(path, (list) => list.pushEdges(...update.value))
+      return state.update(update.field, (resource) => resource.pushEdgesToList(update.id, update.value))
     case "LOAD_RANGE":
-      return state.updateIn(path, (list) => list.setStatusAsLoading())
+      return state.update(update.field, (resource) => resource.list(update.id, (list) => list.setStatusAsLoading()))
     case "RANGE_DELETE":
-      return state.updateIn(path, (list) => list.update("edges", (edges) => edges.filter((item) => !(item in update.deleteIDs))))
-    case "UPDATE":
-      return state.updateIn([update.field, ...update.path], update.update)
+      return state.update(update.field, (resource) => resource.list(update.id, (list) => list.update("edges", (edges) => edges.filter((item) => !(item in update.deleteIDs)))))
+
     default:
       return state
   }
@@ -171,7 +153,7 @@ Store.create = (schema) => {
 }
 
 Store.resource = (type) => {
-  return (name) => new ResourceStoreRecord(name, type)
+  return (name) => ResourceStoreRecord.create(name, type)
 }
 
 Store.type = (type) => {

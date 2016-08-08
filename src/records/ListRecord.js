@@ -31,9 +31,9 @@ class ListRecord extends RawListRecord {
     return this.status === "idle"
   }
   pushEdges(...edges) {
-    return this.edges
-      .push(...edges)
+    return this
       .setStatusAsIdle()
+      .update("edges", (e) => e.push(...edges))
   }
 }
 
